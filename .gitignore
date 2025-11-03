@@ -1,0 +1,40 @@
+# Xcode
+*.xcodeproj/*
+!*.xcodeproj/project.pbxproj
+!*.xcodeproj/xcshareddata/
+!*.xcodeproj/xcschemes/
+*.xcworkspace/*
+!*.xcworkspace/contents.xcworkspacedata
+!*.xcworkspace/xcshareddata/
+*.xcuserdata
+
+# Build
+build/
+DerivedData/
+ImageMetadataApp/Build/
+
+# Swift Package Manager
+.swiftpm/
+.build/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# App specific
+*.app
+
+# User-specific files
+*.xcscheme
+xcuserdata/
+
+# Temporary files
+*.swp
+*.swo
+*~
+
+# ExifTool files (if large, consider adding)
+# Uncomment if you don't want to commit ExifTool
+# ImageMetadataApp/ImageMetadataApp/exiftool
+# ImageMetadataApp/ImageMetadataApp/lib/
