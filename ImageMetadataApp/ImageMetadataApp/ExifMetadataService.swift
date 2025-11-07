@@ -82,6 +82,12 @@ class ExifMetadataService {
         // Update GPS dictionary
         var gps = (mutableMetadata[kCGImagePropertyGPSDictionary as String] as? NSMutableDictionary) ?? NSMutableDictionary()
         
+        // Set GPS Version ID (required by some systems, including iOS)
+        // Version 2.3.0.0 is the standard format
+        if gps[kCGImagePropertyGPSVersion as String] == nil {
+            gps[kCGImagePropertyGPSVersion as String] = [2, 3, 0, 0]
+        }
+        
         // Convert and set EXIF fields
         if let value = metadata.dateTimeOriginal, !value.isEmpty {
             exif[kCGImagePropertyExifDateTimeOriginal as String] = value
@@ -125,18 +131,95 @@ class ExifMetadataService {
             tiff[kCGImagePropertyTIFFModel as String] = value
         }
         
-        // GPS fields
-        if let value = metadata.gpsLatitude, !value.isEmpty {
-            gps[kCGImagePropertyGPSLatitude as String] = parseGPSString(value)
+        // GPS fields - must be positive values with proper references for iOS compatibility
+        // ImageIO accepts decimal degrees, but we need to ensure proper format and validation
+        
+        // Parse both coordinates first to check for potential swapping
+        var parsedLatitude: Double?
+        var parsedLongitude: Double?
+        
+        if let latitudeValue = metadata.gpsLatitude, !latitudeValue.isEmpty {
+            parsedLatitude = parseGPSCoordinate(latitudeValue, reference: metadata.gpsLatitudeRef)
         }
-        if let value = metadata.gpsLatitudeRef, !value.isEmpty {
-            gps[kCGImagePropertyGPSLatitudeRef as String] = value
+        
+        if let longitudeValue = metadata.gpsLongitude, !longitudeValue.isEmpty {
+            parsedLongitude = parseGPSCoordinate(longitudeValue, reference: metadata.gpsLongitudeRef)
         }
-        if let value = metadata.gpsLongitude, !value.isEmpty {
-            gps[kCGImagePropertyGPSLongitude as String] = parseGPSString(value)
+        
+        // Detect potential coordinate swapping (if latitude > 90, it might actually be a longitude)
+        if let lat = parsedLatitude, let lon = parsedLongitude {
+            if abs(lat) > 90.0 && abs(lat) <= 180.0 && abs(lon) <= 90.0 {
+                print("WARNING: Possible coordinate swap detected!")
+                print("  Latitude value (\(lat)) is outside valid range (-90 to 90) but could be a longitude")
+                print("  Longitude value (\(lon)) is in valid longitude range")
+                print("  This might indicate coordinates are swapped in the source data")
+            }
         }
-        if let value = metadata.gpsLongitudeRef, !value.isEmpty {
-            gps[kCGImagePropertyGPSLongitudeRef as String] = value
+        
+        // Set latitude
+        if let latitude = parsedLatitude {
+            // Validate latitude range (-90 to 90)
+            if abs(latitude) > 90.0 {
+                print("ERROR: Invalid latitude value: \(latitude). Must be between -90 and 90. Skipping GPS latitude.")
+            } else {
+                // Always store as positive value with reference (EXIF standard)
+                let absLatitude = abs(latitude)
+                // Store as NSNumber to ensure proper type for ImageIO
+                gps[kCGImagePropertyGPSLatitude as String] = NSNumber(value: absLatitude)
+                
+                // Set reference - use provided or infer from sign
+                var latRef: String
+                if let ref = metadata.gpsLatitudeRef, !ref.isEmpty {
+                    latRef = ref.uppercased()
+                    // Validate reference matches coordinate sign
+                    if (latitude < 0 && latRef != "S") || (latitude >= 0 && latRef != "N") {
+                        // Override with correct reference based on coordinate sign
+                        latRef = latitude < 0 ? "S" : "N"
+                    }
+                } else {
+                    // Infer from sign if reference not provided
+                    latRef = latitude < 0 ? "S" : "N"
+                }
+                gps[kCGImagePropertyGPSLatitudeRef as String] = latRef
+                
+                let latitudeValue = metadata.gpsLatitude ?? "unknown"
+                print("GPS Latitude: \(absLatitude) \(latRef) (from input: \(latitudeValue), ref: \(metadata.gpsLatitudeRef ?? "none"))")
+            }
+        } else if let latitudeValue = metadata.gpsLatitude, !latitudeValue.isEmpty {
+            print("ERROR: Failed to parse latitude: \(latitudeValue)")
+        }
+        
+        // Set longitude
+        if let longitude = parsedLongitude {
+            // Validate longitude range (-180 to 180)
+            if abs(longitude) > 180.0 {
+                print("ERROR: Invalid longitude value: \(longitude). Must be between -180 and 180. Skipping GPS longitude.")
+            } else {
+                // Always store as positive value with reference (EXIF standard)
+                let absLongitude = abs(longitude)
+                // Store as NSNumber to ensure proper type for ImageIO
+                gps[kCGImagePropertyGPSLongitude as String] = NSNumber(value: absLongitude)
+                
+                // Set reference - use provided or infer from sign
+                var lonRef: String
+                if let ref = metadata.gpsLongitudeRef, !ref.isEmpty {
+                    lonRef = ref.uppercased()
+                    // Validate reference matches coordinate sign
+                    if (longitude < 0 && lonRef != "W") || (longitude >= 0 && lonRef != "E") {
+                        // Override with correct reference based on coordinate sign
+                        lonRef = longitude < 0 ? "W" : "E"
+                    }
+                } else {
+                    // Infer from sign if reference not provided
+                    lonRef = longitude < 0 ? "W" : "E"
+                }
+                gps[kCGImagePropertyGPSLongitudeRef as String] = lonRef
+                
+                let longitudeValue = metadata.gpsLongitude ?? "unknown"
+                print("GPS Longitude: \(absLongitude) \(lonRef) (from input: \(longitudeValue), ref: \(metadata.gpsLongitudeRef ?? "none"))")
+            }
+        } else if let longitudeValue = metadata.gpsLongitude, !longitudeValue.isEmpty {
+            print("ERROR: Failed to parse longitude: \(longitudeValue)")
         }
         
         // Update mutable metadata
@@ -241,13 +324,40 @@ class ExifMetadataService {
         }
     }
     
-    /// Parse GPS coordinate string like "38deg 34' 50\" N" to decimal degrees
-    private func parseGPSString(_ gpsString: String) -> Double? {
-        // Parse format: "38deg 34' 50\" N" to 38.6138889
+    /// Parse GPS coordinate string - supports both decimal and DMS formats
+    /// Formats supported:
+    /// - Decimal: "38.6138889" or "-38.6138889"
+    /// - DMS: "38deg 34' 50\" N" or "38 34 50 N"
+    /// Returns signed decimal degrees (negative for S/W)
+    private func parseGPSCoordinate(_ gpsString: String, reference: String?) -> Double? {
         let cleaned = gpsString.trimmingCharacters(in: .whitespaces)
-        let parts = cleaned.components(separatedBy: CharacterSet(charactersIn: "deg'\""))
+        
+        // First, try parsing as simple decimal number
+        if let decimal = Double(cleaned) {
+            // If it's already a decimal, check reference or sign
+            if let ref = reference?.uppercased(), !ref.isEmpty {
+                // Reference provided - ensure coordinate matches
+                if (ref == "S" || ref == "W") && decimal > 0 {
+                    return -decimal
+                } else if (ref == "N" || ref == "E") && decimal < 0 {
+                    return abs(decimal)
+                }
+            }
+            return decimal
+        }
+        
+        // Try parsing as DMS format: "38deg 34' 50\" N" or "38 34 50 N"
+        // Remove common separators and split
+        let normalized = cleaned
+            .replacingOccurrences(of: "deg", with: " ")
+            .replacingOccurrences(of: "°", with: " ")
+            .replacingOccurrences(of: "'", with: " ")
+            .replacingOccurrences(of: "\"", with: " ")
+            .replacingOccurrences(of: "  ", with: " ")
+        
+        let parts = normalized.components(separatedBy: .whitespaces)
             .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
+            .filter { !$0.isEmpty && !$0.uppercased().contains("N") && !$0.uppercased().contains("S") && !$0.uppercased().contains("E") && !$0.uppercased().contains("W") }
         
         guard parts.count >= 3 else { return nil }
         
@@ -259,8 +369,11 @@ class ExifMetadataService {
         
         var decimal = degrees + minutes / 60.0 + seconds / 3600.0
         
-        // Check for direction indicator (last part or in string)
-        if cleaned.contains("S") || cleaned.contains("W") {
+        // Check for direction indicator in string or reference parameter
+        let upperCleaned = cleaned.uppercased()
+        let upperRef = reference?.uppercased() ?? ""
+        
+        if upperCleaned.contains("S") || upperCleaned.contains("W") || upperRef == "S" || upperRef == "W" {
             decimal = -decimal
         }
         
